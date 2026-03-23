@@ -2,32 +2,44 @@ clc
 clear
 close all
 
-%% ================= MAP SETUP =================
-% Create a 50x50 grid map (0 = free, 1 = obstacle)
+%% ================= MAP =================
+% Create grid map (0 = free space, 1 = obstacle/shelf)
 
 mapSize = 50;
 map = zeros(mapSize);
 
-% Vertical shelves (obstacles)
+% Vertical shelves
 map(:,12)=1;
 map(:,25)=1;
 map(:,38)=1;
 
-% Create aisle gaps in shelves
+% Open aisle gaps in shelves
 map(15:35,12)=0;
 map(15:35,25)=0;
 map(15:35,38)=0;
 
 %% ================= ROBOT =================
-% Initial robot position and orientation
+% Robot initial state
 
-robot.x = 5;
-robot.y = 5;
-robot.theta = 0;   % heading angle
-robotRadius = 0.7;
+robot.x = 5;          % X position
+robot.y = 5;          % Y position
+robot.theta = 0;      % Orientation (heading angle)
+robotRadius = 0.7;    % Size of robot
+
+%% ================= METRICS =================
+% Performance tracking
+
+totalDistance = 0;    % Distance traveled
+stopCount = 0;        % Number of stops due to humans
+startTime = tic;      % Start timer
+
+%% ================= TRAJECTORY =================
+% Store actual path followed by robot
+
+trajectory = [];
 
 %% ================= ITEMS =================
-% Items placed ON SHELVES (fixed positions)
+% Fixed item locations on shelves
 
 items = [
     12 12
@@ -41,28 +53,34 @@ items = [
     38 38
 ];
 
+% Track which items are collected (avoid index errors)
+collected = false(size(items,1),1);
+
 %% ================= PEOPLE =================
-% Random background people
+% Random moving humans (purple)
 
 numPeople = 3;
 people = rand(numPeople,2)*40+5;
 
-% Main human (for blocking demo)
+% Main human (red) used for interception demo
 mainPerson = [30 30];
-humanTriggered = false;
 
-%% ================= VISIT ORDER =================
-% Compute visiting order using nearest neighbour
+interceptCount = 0;
+maxIntercepts = 4;   % limit number of forced interceptions
+
+%% ================= ORDER =================
+% Compute visiting order using Nearest Neighbour
 
 order = nearestNeighbour([robot.x robot.y],items);
 
 %% ================= LIDAR =================
-% Simulated 2D LIDAR
+% Simulated LIDAR parameters
 
 lidarRange = 8;
 angles = linspace(-pi,pi,40);
 
 %% ================= FIGURE =================
+% Initialize visualization
 
 figure
 hold on
@@ -74,191 +92,246 @@ imagesc(map')
 colormap(gray)
 
 %% ================= MAIN LOOP =================
+% Loop through all items in computed order
 
 for i = 1:length(order)
 
-    % Current target item
-    itemTarget = items(order(i),:);
+    idx = order(i);
 
-    % Convert shelf position → reachable free cell
+    % Skip already collected items
+    if collected(idx)
+        continue
+    end
+
+    % Target item
+    itemTarget = items(idx,:);
+
+    % Convert shelf location → reachable free cell
     goal = getReachableGoal(map, itemTarget);
 
     % Plan path using A*
     path = astar(map,[robot.x robot.y],goal);
 
-    if isempty(path)
-        continue
-    end
+    if isempty(path), continue, end
 
     k = 1;
 
-    %% ===== FOLLOW PATH =====
+    %% ===== PATH FOLLOWING LOOP =====
     while k <= size(path,1)
 
         target = path(k,:);
+
+        % Distance to current waypoint
         distToTarget = norm([robot.x robot.y] - target);
 
-        % Move to next waypoint if close enough
+        % Move to next waypoint if close
         if distToTarget < 0.4
             k = k + 1;
             continue
         end
 
-        %% 🔥 HUMAN INTERCEPTION LOGIC
-        % Place human ON robot path once
+        %% ===== HUMAN INTERCEPTION =====
+        % Place blocking human ahead on path
 
-        if ~humanTriggered && k > 5 && k+2 <= size(path,1)
-            mainPerson = path(k+2,:);  % block ahead
-            humanTriggered = true;
+        if interceptCount < maxIntercepts && k > 5 && k+3 <= size(path,1)
+            mainPerson = path(k+3,:);
+            interceptCount = interceptCount + 1;
         end
 
-        %% 🔥 HUMAN MOVEMENT (CROSSING BEHAVIOR)
-        if humanTriggered
+        %% ===== HUMAN MOVEMENT =====
+        % Main human moves across aisle
 
-            % Human walks across aisle (right direction)
-            mainPerson = mainPerson + [0.2 0];
+        mainPerson = mainPerson + [0.15 0];
+        mainPerson = max(2,min(mapSize-2,mainPerson));
 
-            % Once far → remove human
-            if norm(mainPerson - [robot.x robot.y]) > 6
-                humanTriggered = false;
-                mainPerson = [45 45]; % move away
+        % Random movement of other humans
+        for p=1:numPeople
+            people(p,:) = people(p,:) + randn(1,2)*0.3;
+            people(p,:) = max(2,min(mapSize-2,people(p,:)));
+        end
+
+        %% ===== HUMAN DETECTION =====
+        isBlocked = false;
+
+        % Check main human
+        if norm([robot.x robot.y] - mainPerson) < 2.5
+            isBlocked = true;
+        end
+
+        % Check all other humans
+        for p=1:numPeople
+            if norm([robot.x robot.y] - people(p,:)) < 2.5
+                isBlocked = true;
+                break
             end
         end
 
-        % Keep human inside bounds
-        mainPerson = max(2,min(mapSize-2,mainPerson));
+        %% ===== REPLANNING =====
+        if isBlocked
 
-        %% 🚨 OBSTACLE DETECTION (HUMAN)
-        if humanTriggered && norm([robot.x robot.y] - mainPerson) < 2.5
+            stopCount = stopCount + 1;
 
-            % Clear and redraw scene
-            cla
-            drawScene(map, items, goal, people, mainPerson, path)
+            % Create temporary map including humans as obstacles
+            tempMap = map;
 
-            % Display waiting message
-            text(robot.x+1, robot.y+1, ...
-                'WAITING FOR HUMAN TO MOVE',...
-                'Color','r','FontSize',10)
+            humans = [mainPerson; people];
 
-            % Robot LED = RED (stopped)
-            drawRobot(robot, robotRadius, 'r')
+            % Add safety radius around humans
+            for h = 1:size(humans,1)
 
-            % Show LIDAR
-            drawLidar(robot, angles, lidarRange, map)
+                hx = round(humans(h,1));
+                hy = round(humans(h,2));
 
-            title('🚨 HUMAN BLOCKING → ROBOT STOPPED')
+                for dx=-1:1
+                    for dy=-1:1
+                        nx = hx + dx;
+                        ny = hy + dy;
 
-            drawnow
-            pause(0.1)
+                        if nx>=1 && ny>=1 && nx<=mapSize && ny<=mapSize
+                            tempMap(nx,ny) = 1;
+                        end
+                    end
+                end
+            end
 
-            continue   % HARD STOP (no movement)
+            % Recompute path
+            newPath = astar(tempMap,[robot.x robot.y],goal);
+
+            if ~isempty(newPath)
+                path = newPath;
+                k = 1;   % restart path tracking
+            else
+                % No path → wait
+                cla
+                drawScene(map,items,goal,people,mainPerson,path,trajectory)
+
+                text(robot.x+1,robot.y+1,'WAITING FOR HUMAN','Color','r')
+
+                drawRobot(robot,robotRadius,'r')
+                drawLidar(robot,angles,lidarRange,map)
+
+                title('🚨 BLOCKED')
+
+                drawnow
+                pause(0.1)
+                continue
+            end
         end
 
-        %% ================= ROBOT MOTION =================
-        % Smooth differential drive style motion
+        %% ===== ROBOT MOTION =====
+        % Compute direction to target
 
         dx = target(1) - robot.x;
         dy = target(2) - robot.y;
+
         dist = sqrt(dx^2 + dy^2);
 
         if dist > 0.01
 
-            % Desired direction
+            % Desired heading
             desiredTheta = atan2(dy,dx);
 
-            % Angle error correction
+            % Angular error
             angleError = wrapToPi(desiredTheta - robot.theta);
 
-            % Rotate smoothly
+            % Smooth rotation
             robot.theta = robot.theta + 0.25 * angleError;
 
-            % Move forward only when aligned
+            % Move only if aligned
             if abs(angleError) < 0.4
                 step = min(0.5, dist);
+
                 robot.x = robot.x + step*cos(robot.theta);
                 robot.y = robot.y + step*sin(robot.theta);
+
+                totalDistance = totalDistance + step;
             end
         end
 
-        % Snap to waypoint (prevents spinning issue)
+        % Snap to waypoint (prevents spinning)
         if dist < 0.2
             robot.x = target(1);
             robot.y = target(2);
         end
 
         % Keep robot inside map
-        robot.x = max(1, min(mapSize, robot.x));
-        robot.y = max(1, min(mapSize, robot.y));
+        robot.x = max(1,min(mapSize,robot.x));
+        robot.y = max(1,min(mapSize,robot.y));
 
-        %% ================= RANDOM PEOPLE =================
-        for p=1:numPeople
-            people(p,:) = people(p,:) + randn(1,2)*0.3;
-            people(p,:) = max(2,min(mapSize-2,people(p,:)));
-        end
+        %% ===== STORE TRAJECTORY =====
+        trajectory = [trajectory; robot.x robot.y];
 
-        %% ================= DRAW =================
+        %% ===== DRAW =====
         cla
-        drawScene(map, items, goal, people, mainPerson, path)
+        drawScene(map,items,goal,people,mainPerson,path,trajectory)
 
-        % Robot LED = GREEN (moving)
-        drawRobot(robot, robotRadius, 'g')
+        % Display remaining items
+        text(2,48,"Items Left: " + sum(~collected),'Color','y')
 
-        drawLidar(robot, angles, lidarRange, map)
+        drawRobot(robot,robotRadius,'g')
+        drawLidar(robot,angles,lidarRange,map)
 
-        title('FINAL: Human Intercepts → Robot Stops → Continues')
+        title('FINAL: Human-Aware Robot with Trajectory')
 
         drawnow
         pause(0.05)
 
-        %% ================= GOAL CHECK =================
+        %% ===== GOAL CHECK =====
         if norm([robot.x robot.y]-goal)<1
             simulateArm(robot)
+            collected(idx) = true;
             break
         end
 
     end
 end
 
-disp("All items collected!")
+%% ================= METRICS =================
+disp("Total Distance: " + totalDistance)
+disp("Total Stops: " + stopCount)
+disp("Total Time: " + toc(startTime))
 
-%% ================= DRAW FUNCTIONS =================
+%% ================= FUNCTIONS =================
 
-function drawScene(map, items, goal, people, mainPerson, path)
+function drawScene(map, items, goal, people, mainPerson, path, trajectory)
 imagesc(map')
 colormap(gray)
 hold on
 
-% Items
-plot(items(:,1),items(:,2),'rx','MarkerSize',12,'LineWidth',2)
+% Items (red X)
+plot(items(:,1),items(:,2),'rx','LineWidth',2)
 
-% Current goal
-plot(goal(1),goal(2),'go','MarkerSize',12,'LineWidth',2)
+% Goal (green circle)
+plot(goal(1),goal(2),'go','LineWidth',2)
 
-% Random people
-plot(people(:,1),people(:,2),'mo','MarkerSize',10,'LineWidth',2)
+% Random humans (purple)
+plot(people(:,1),people(:,2),'mo','LineWidth',2)
 
-% Blocking human
-plot(mainPerson(1),mainPerson(2),'ro','MarkerSize',14,'LineWidth',3)
+% Blocking human (red circle)
+plot(mainPerson(1),mainPerson(2),'ro','LineWidth',3)
 
-% Path
+% Planned path (green)
 if ~isempty(path)
     plot(path(:,1),path(:,2),'g','LineWidth',2)
 end
+
+% Actual trajectory (blue dashed)
+if ~isempty(trajectory)
+    plot(trajectory(:,1),trajectory(:,2),'b--','LineWidth',1.5)
+end
 end
 
-function drawRobot(robot, r, ledColor)
-
+function drawRobot(robot, r, color)
 theta = linspace(0,2*pi,40);
 
 % Robot body
 fill(robot.x + r*cos(theta),robot.y + r*sin(theta),'b')
 
-% Heading arrow
+% Direction arrow
 quiver(robot.x,robot.y,cos(robot.theta),sin(robot.theta),1,'w','LineWidth',2);
 
-% LED indicator (status)
-plot(robot.x, robot.y+1.2,'o',...
-    'MarkerFaceColor',ledColor,'Color',ledColor)
+% Status LED
+plot(robot.x, robot.y+1,'o','MarkerFaceColor',color,'Color',color)
 end
 
 function drawLidar(robot, angles, range, map)
@@ -280,137 +353,4 @@ end
 
 plot([robot.x rx],[robot.y ry],'c')
 end
-end
-
-%% ================= SCARA ARM =================
-function simulateArm(robot)
-for z=0:0.1:1
-plot(robot.x,robot.y+z,'ys','MarkerSize',8,'MarkerFaceColor','y')
-drawnow
-pause(0.05)
-end
-for z=1:-0.1:0
-plot(robot.x,robot.y+z,'ys','MarkerSize',8,'MarkerFaceColor','y')
-drawnow
-pause(0.05)
-end
-end
-
-%% ================= NEAREST NEIGHBOUR =================
-function order = nearestNeighbour(start,items)
-remaining = items; order=[]; pos=start; indices=1:size(items,1);
-while ~isempty(remaining)
-dist = vecnorm(remaining-pos,2,2);
-[~,idx]=min(dist);
-order(end+1)=indices(idx);
-pos=remaining(idx,:);
-remaining(idx,:)=[];
-indices(idx)=[];
-end
-end
-
-%% ================= A* PATH PLANNER =================
-function path = astar(map,start,goal)
-
-start=round(start);
-goal=round(goal);
-
-moves=[1 0;-1 0;0 1;0 -1];
-
-open=start;
-cameFrom=containers.Map;
-
-gScore=inf(size(map));
-gScore(start(1),start(2))=0;
-
-fScore=inf(size(map));
-fScore(start(1),start(2))=norm(start-goal);
-
-while ~isempty(open)
-
-scores=arrayfun(@(i)fScore(open(i,1),open(i,2)),1:size(open,1));
-[~,idx]=min(scores);
-
-current=open(idx,:);
-
-if isequal(current,goal)
-path=reconstruct(cameFrom,current);
-return
-end
-
-open(idx,:)=[];
-
-for m=1:4
-
-neighbor=current+moves(m,:);
-
-if neighbor(1)<1 || neighbor(2)<1 || neighbor(1)>size(map,1) || neighbor(2)>size(map,2)
-continue
-end
-
-if map(neighbor(1),neighbor(2))==1
-continue
-end
-
-tent=gScore(current(1),current(2))+1;
-
-if tent<gScore(neighbor(1),neighbor(2))
-
-cameFrom(mat2str(neighbor))=current;
-gScore(neighbor(1),neighbor(2))=tent;
-fScore(neighbor(1),neighbor(2))=tent+norm(neighbor-goal);
-
-if ~ismember(neighbor,open,'rows')
-open=[open;neighbor];
-end
-
-end
-
-end
-
-end
-
-path=[];
-end
-
-%% ================= PATH RECONSTRUCTION =================
-function path=reconstruct(cameFrom,current)
-
-path=current;
-
-while true
-key=mat2str(current);
-
-if ~isKey(cameFrom,key)
-break
-end
-
-current=cameFrom(key);
-path=[current;path];
-end
-
-end
-
-%% ================= GOAL FIX =================
-function goal = getReachableGoal(map, item)
-
-x=item(1);
-y=item(2);
-
-neighbors=[x+1 y; x-1 y; x y+1; x y-1];
-
-for i=1:4
-nx=neighbors(i,1);
-ny=neighbors(i,2);
-
-if nx>=1 && ny>=1 && nx<=size(map,1) && ny<=size(map,2)
-if map(nx,ny)==0
-goal=[nx ny];
-return
-end
-end
-end
-
-goal=item;
-
 end
